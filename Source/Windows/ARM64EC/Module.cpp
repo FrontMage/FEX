@@ -64,6 +64,55 @@ namespace Exception {
 class ECSyscallHandler;
 }
 
+namespace FullEFlagsSideband {
+static constexpr uint16_t MAGIC {0x4645};
+static constexpr uint8_t VERSION {1};
+static constexpr uint8_t OFFER {0x01};
+static constexpr uint8_t ACK {0x02};
+static constexpr uint8_t FEX_TO_WINE_EXCEPTION {0x10};
+static constexpr uint8_t WINE_TO_FEX_CONTINUE {0x20};
+static constexpr uint32_t EFLAGS_RF_BIT {1U << 16};
+
+constexpr uint64_t Make(uint8_t Kind, uint32_t EFlags = 0) {
+  return static_cast<uint64_t>(MAGIC) << 48 | static_cast<uint64_t>(VERSION) << 40 | static_cast<uint64_t>(Kind) << 32 | EFlags;
+}
+
+constexpr bool Is(uint64_t Value, uint8_t Kind) {
+  return static_cast<uint16_t>(Value >> 48) == MAGIC && static_cast<uint8_t>(Value >> 40) == VERSION &&
+         static_cast<uint8_t>(Value >> 32) == Kind;
+}
+
+constexpr uint32_t EFlags(uint64_t Value) {
+  return static_cast<uint32_t>(Value);
+}
+
+inline uint64_t Exchange(uint64_t& Slot, uint64_t Value = 0) {
+  return __atomic_exchange_n(&Slot, Value, __ATOMIC_ACQ_REL);
+}
+
+inline void ReleaseStore(uint64_t& Slot, uint64_t Value) {
+  __atomic_store_n(&Slot, Value, __ATOMIC_RELEASE);
+}
+
+constexpr bool ShouldSetResumeFlag(bool Generated, uint32_t Signal, uint32_t TrapNo, uint32_t ErrorCode) {
+  return Generated && Signal == FEXCore::Core::FAULT_SIGSEGV && TrapNo == FEXCore::X86State::X86_TRAPNO_GP &&
+         (ErrorCode & 0b111) != 0b010;
+}
+
+static_assert(Make(OFFER) == 0x4645'0101'0000'0000);
+static_assert(Make(ACK) == 0x4645'0102'0000'0000);
+static_assert(Make(FEX_TO_WINE_EXCEPTION, 0x0001'0297) == 0x4645'0110'0001'0297);
+static_assert(Make(WINE_TO_FEX_CONTINUE, 0x002F'7FD7) == 0x4645'0120'002F'7FD7);
+static_assert(Is(Make(OFFER), OFFER));
+static_assert(!Is(Make(OFFER), ACK));
+static_assert(!Is(0x4646'0101'0000'0000, OFFER));
+static_assert(!Is(0x4645'0201'0000'0000, OFFER));
+static_assert(EFlags(Make(FEX_TO_WINE_EXCEPTION, 0x0001'0297)) == 0x0001'0297);
+static_assert(ShouldSetResumeFlag(true, FEXCore::Core::FAULT_SIGSEGV, FEXCore::X86State::X86_TRAPNO_GP, 0));
+static_assert(!ShouldSetResumeFlag(true, FEXCore::Core::FAULT_SIGSEGV, FEXCore::X86State::X86_TRAPNO_GP, 0x2C << 3 | 2));
+static_assert(!ShouldSetResumeFlag(true, FEXCore::Core::FAULT_SIGTRAP, FEXCore::X86State::X86_TRAPNO_DB, 0));
+} // namespace FullEFlagsSideband
+
 extern "C" {
 extern IMAGE_DOS_HEADER __ImageBase; // Provided by the linker
 
@@ -112,6 +161,10 @@ struct ThreadCPUArea {
     return *Area->ContextAmd64;
   }
 
+  uint64_t& EmulatorDataInline() const {
+    return Area->EmulatorDataInline;
+  }
+
   FEXCore::Core::CpuStateFrame*& StateFrame() const {
     return reinterpret_cast<FEXCore::Core::CpuStateFrame*&>(Area->EmulatorData[0]);
   }
@@ -131,6 +184,9 @@ struct ThreadCPUArea {
 
 struct FrontendThreadData {
   bool InLockedRWXRead {};
+  // Wine initially aliases this context to EmulatorDataInline. Reserve the
+  // inline field for the negotiated flags mailbox and retain separate storage.
+  alignas(16) ARM64EC_NT_CONTEXT ContextAmd64 {};
 };
 
 namespace {
@@ -142,6 +198,7 @@ std::optional<FEX::Windows::InvalidationTracker> InvalidationTracker;
 std::optional<FEX::Windows::CPUFeatures> CPUFeatures;
 std::optional<FEX::Windows::OvercommitTracker> OvercommitTracker;
 std::optional<FEX::Windows::ImageTracker> ImageTracker;
+bool FullEFlagsSidebandEnabled {};
 
 std::recursive_mutex ThreadCreationMutex;
 // Map of TIDs to their FEX thread state, `ThreadCreationMutex` must be locked when accessing
@@ -487,6 +544,17 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
     ReconstructThreadState(Thread, Context);
   }
   Args->Context = StoreStateToPackedECContext(Thread, Context.Fpcr, Context.Fpsr);
+  uint32_t HandlerEFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
+  if (FullEFlagsSideband::ShouldSetResumeFlag(
+        Fault.FaultToTopAndGeneratedException, Fault.Signal, Fault.TrapNo, Fault.err_code)) {
+    // Fault-class x86 exceptions expose RF in the saved handler context. Keep
+    // it out of the live JIT state until the handler chooses to continue.
+    HandlerEFlags |= FullEFlagsSideband::EFLAGS_RF_BIT;
+  }
+  if (FullEFlagsSidebandEnabled) {
+    FullEFlagsSideband::ReleaseStore(GetCPUArea().EmulatorDataInline(),
+                                     FullEFlagsSideband::Make(FullEFlagsSideband::FEX_TO_WINE_EXCEPTION, HandlerEFlags));
+  }
   LogMan::Msg::DFmt("pc: {:X} rip: {:X}", Context.Pc, Args->Context.Pc);
 
   // X64 Windows always clears TF, DF and AF when handling an exception, restoring after.
@@ -565,19 +633,33 @@ public:
 
 extern "C" void SyncThreadContext(CONTEXT* Context) {
   ProcessPendingCrossProcessEmulatorWork();
-  auto* Thread = GetCPUArea().ThreadState();
+  const auto CPUArea = GetCPUArea();
+  auto* Thread = CPUArea.ThreadState();
   // All other EFlags bits are lost when converting to/from an ARM64EC context, so merge them in from the current JIT state.
   // This is advisable over dropping their values as thread suspend/resume uses this function, and that can happen at any point in guest code.
   static constexpr uint32_t ECValidEFlagsMask {(1U << FEXCore::X86State::RFLAG_OF_RAW_LOC) | (1U << FEXCore::X86State::RFLAG_CF_RAW_LOC) |
                                                (1U << FEXCore::X86State::RFLAG_ZF_RAW_LOC) | (1U << FEXCore::X86State::RFLAG_SF_RAW_LOC) |
                                                (1U << FEXCore::X86State::RFLAG_TF_RAW_LOC)};
 
-  uint32_t StateEFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
-  Context->EFlags = (Context->EFlags & ECValidEFlagsMask) | (StateEFlags & ~ECValidEFlagsMask);
+  const uint64_t Sideband =
+    FullEFlagsSidebandEnabled ? FullEFlagsSideband::Exchange(CPUArea.EmulatorDataInline()) : 0;
+  if (FullEFlagsSideband::Is(Sideband, FullEFlagsSideband::WINE_TO_FEX_CONTINUE)) {
+    // FEX does not yet perform instruction-breakpoint checks. Consuming RF here
+    // models the architecturally empty check at the start of the resumed x86
+    // instruction and prevents RF from becoming sticky guest state.
+    Context->EFlags = FullEFlagsSideband::EFlags(Sideband) & ~FullEFlagsSideband::EFLAGS_RF_BIT;
+  } else {
+    uint32_t StateEFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
+    Context->EFlags = (Context->EFlags & ECValidEFlagsMask) | (StateEFlags & ~ECValidEFlagsMask);
+  }
   Exception::LoadStateFromECContext(Thread, *Context);
 }
 
 NTSTATUS ProcessInit() {
+  const auto CPUArea = GetCPUArea();
+  const bool FullEFlagsOffered =
+    FullEFlagsSideband::Is(FullEFlagsSideband::Exchange(CPUArea.EmulatorDataInline()), FullEFlagsSideband::OFFER);
+
   InitSyscalls();
 
   FEX::Windows::InitCRTProcess();
@@ -648,6 +730,11 @@ NTSTATUS ProcessInit() {
   if (StartupSleep() && (StartupSleepProcName().empty() || ExecutableName == StartupSleepProcName())) {
     LogMan::Msg::IFmt("[{}][{}] Sleeping for {} seconds", GetCurrentProcessId(), ExecutableName, StartupSleep());
     std::this_thread::sleep_for(std::chrono::seconds(StartupSleep()));
+  }
+
+  FullEFlagsSidebandEnabled = FullEFlagsOffered;
+  if (FullEFlagsSidebandEnabled) {
+    FullEFlagsSideband::ReleaseStore(CPUArea.EmulatorDataInline(), FullEFlagsSideband::Make(FullEFlagsSideband::ACK));
   }
 
   return STATUS_SUCCESS;
@@ -925,6 +1012,9 @@ NTSTATUS ThreadInit() {
   CPUArea.EmulatorStackBase() = EmulatorStack + EmulatorStackSize;
 
   auto* Thread = CTX->CreateThread(0, 0);
+  auto* FrontendData = new FrontendThreadData();
+  CPUArea.Area->ContextAmd64 = &FrontendData->ContextAmd64;
+  FullEFlagsSideband::ReleaseStore(CPUArea.EmulatorDataInline(), 0);
 
   // Default segment setup.
   auto Frame = Thread->CurrentFrame;
@@ -967,7 +1057,7 @@ NTSTATUS ThreadInit() {
                             .AMD64_ControlWord = 0x27f};
   Exception::LoadStateFromECContext(Thread, CPUArea.ContextAmd64().AMD64_Context);
 
-  Thread->FrontendPtr = new FrontendThreadData();
+  Thread->FrontendPtr = FrontendData;
 
   {
     auto ThreadTID = GetCurrentThreadId();
